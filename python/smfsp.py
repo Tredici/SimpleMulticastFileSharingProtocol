@@ -120,6 +120,48 @@ def __extract_chunk(b, offset=0):
         'data': data
     }, offset)
 
+
+def __extract_chunk_list_req(b, offset=0):
+    buflen = len(b)
+
+    # EXTRACT FILENAME
+    if buflen - offset < 1:
+        raise Exception("Malformed buffer - missing filename length")
+    strlen = b2i(b[offset:offset+1])
+    offset += 1
+    # ensure there is enough space for file name and length
+    if buflen - offset < strlen:
+        raise Exception("Malformed buffer - missing filename")
+    filename = b[offset:offset+strlen].decode()
+    offset += strlen
+
+    # are file size and list length present?
+    if buflen - offset < 12: # [long + int]
+        raise Exception("Malformed buffer - missing header")
+
+    # get total file size    
+    size = b2i(b[offset:offset+8])
+    offset += 8
+    # get chunk offset
+    cnk_list_len = b2i(b[offset:offset+4])
+    offset += 4
+
+    # is list present? One [long] per item
+    if buflen - offset < cnk_list_len*8:
+        raise Exception("Malformed buffer - missing header")
+    # collect all list elements
+    cnk_list = []
+    for _ in range(cnk_list_len):
+        cnk_list.append(b2i(b[offset:offset+8]))
+        offset += 8
+
+    return ({
+        'name': filename,
+        'size': size,
+        'cnk_list': cnk_list,
+    }, offset)
+
+
 # check packet checksum
 #   buffer  =>  packet content in byte
 def __assert_packet_checksum(buffer, offset):
@@ -165,6 +207,18 @@ CNK_OFFER = b'OFER'[:TYPE_LENGTH] # sent by a server
 # available servers to send thei hello packets
 CLN_HELLO = b'CHLO'[:TYPE_LENGTH] # sent by a client
 
+# this message is sent from a client to a server in order
+# to require a specified list of chunks.
+# Chunks are then broadcasted from the server to all clients.
+#
+# The packet body contains:
+#   requested file name
+#   requested file size
+#   chunk list lentgh (1-MAX_CHUNKS_PER_REQ=128) [int, 4 bytes]
+#   for each requested chunk:
+#       a [long] containing the chunk id
+CNK_LIST_REQ = b'CLST'[:TYPE_LENGTH] # sent by a client
+
 def type2name(pckt_type):
     if pckt_type == SRV_HELLO:
         return "SRV_HELLO"
@@ -172,6 +226,8 @@ def type2name(pckt_type):
         return "CLN_HELLO"
     if pckt_type == CNK_OFFER:
         return "CNK_OFFER"
+    if pckt_type == CNK_LIST_REQ:
+        return "CNK_LIST_REQ"
     else:
         raise Exception("Unknown packet type")
 
@@ -241,7 +297,7 @@ def send_chunk(s, dest_addr, fmap, reqfile, cnk_num, cnk_sz=conf.DEFAULT_CHUNK_S
         i2b(size, limit=8) +\
         i2b(cnk_offset, limit=8) +\
         i2b(cnk_sz, limit=8) +\
-        i2b(1 if cnk_sz else 0, limit=1) 
+        i2b(1 if last_cnk else 0, limit=1) 
 
     with open(filename, 'rb') as f:
         f.seek(cnk_offset)
@@ -262,7 +318,19 @@ def send_client_hello(s, dest_address, hash_type=HASH_SHA256):
     packet = MAGIC + CLN_HELLO
     __hash_and_send(s, dest_address, packet, hash_type)
 
-
+# build and send a CNK_LIST_REQ message
+def send_chunk_list_req(s, dest_address,
+        remote_file,
+        expected_size,
+        cnk_list,
+        hash_type=HASH_SHA256):
+    packet = MAGIC + CNK_LIST_REQ +\
+        serialize_short_str(remote_file) +\
+        i2b(expected_size, limit=8) +\
+        i2b(len(cnk_list), limit=4) +\
+        b''.join(map(lambda n: i2b(n, limit=8), cnk_list))
+        
+    __hash_and_send(s, dest_address, packet, hash_type)
 
 # return a tuple
 # (header, parsed packet)
@@ -286,6 +354,8 @@ def parse_packet(packet):
         content = None # no data associated with a client hello
     elif msg_type == CNK_OFFER:
         content, offset = __extract_chunk(packet, offset)
+    elif msg_type == CNK_LIST_REQ:
+        content, offset = __extract_chunk_list_req(packet, offset)
     else:
         raise Exception("Unknown packet type: " + repr(msg_type))
     # check hash type

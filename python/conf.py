@@ -13,7 +13,11 @@ IPv4_BRD = '255.255.255.255'
 
 # maximum UDP payload
 MAX_PACKET_SIZE = 1400
+# maximum amount of file data in a single packet
 DEFAULT_CHUNK_SIZE = 1024
+# maximum number of chunks requested in a single
+# request message sent by clients to a server
+MAX_CHUNKS_PER_REQ = 128
 
 def analyse_args(optlist, isserver=False):
     verbose = False

@@ -23,6 +23,7 @@ broad_sock = socket.socket(
     socket.SOCK_DGRAM | socket.SOCK_NONBLOCK)
 sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
 
+broadcast_client = ('255.255.255.255', CLIENT_PORT)
 
 def getFileMap(argv):
     ans = {}
@@ -69,9 +70,40 @@ def receive_from(sock_list, timeout=1.0, bufsz = MAX_PACKET_SIZE):
 # immediately
 def server_loop(socket_list, fmap, timeout=1.0, broadcast_addr = '255.255.255.255', client_port=CLIENT_PORT):
     clients = (broadcast_addr, client_port)
+    if verbose:
+        print("Broadcast server hello packet")
     smfsp.send_server_hello(sock, clients, fmap)
+    # has the server some work to complete?
+    pendig_work = False
+    # list of requested chunks
+    req_chunks = []
+    # control structure to avoid sending twice the same chunk
+    waiting_chunks = {}
+    for file in fmap:
+        waiting_chunks[file] = set()
+    # send no more than PACKETS_PER_ITERATION packets
+    # before checking for ner inputs
+    MAX_PACKETS_PER_ITERATION=4
     while True:
-        bytes, sender, _ = receive_from(socket_list, timeout=timeout)
+        if pendig_work:
+            # handle work
+            for _ in range(MAX_PACKETS_PER_ITERATION):
+                if len(req_chunks) <= 1:
+                    # no more works after this
+                    pendig_work = False
+                    if len(req_chunks) == 0:
+                        break
+                w = req_chunks.pop(0)
+                # remove chunk from control list
+                waiting_chunks[w['file']].remove(w['cnk_idx'])
+                if verbose:
+                    print(f"Sending chunk {w['cnk_idx']} of file {w['file']}")
+                smfsp.send_chunk(sock, broadcast_client, fmap, w['file'], w['cnk_idx'])
+                # after having sent the last chunk?
+
+        bytes, sender, _ = receive_from(socket_list,
+                                # cannot wait if something is waiting!
+                                timeout=None if pendig_work else timeout)
         if bytes != None:
             # parse message
             msg_type, content = smfsp.parse_packet(bytes)
@@ -82,7 +114,42 @@ def server_loop(socket_list, fmap, timeout=1.0, broadcast_addr = '255.255.255.25
                 if verbose:
                     print("Send server_hello in response to client hello")
                 smfsp.send_server_hello(sock, sender, fmap)
+            elif msg_type == smfsp.CNK_LIST_REQ:
+                # check file is owned
+                if content['name'] not in fmap:
+                    if verbose:
+                        print(f"Unknown file {content['name']}")
+                    # nothing to do, go on
+                    continue
+                # get file info
+                fmeta = fmap[content['name']]
+                # check on file size
+                if content['size'] != fmeta['size']:
+                    # size mismatch!
+                    if verbose:
+                        print(f"Mismatch in file [{content['name']}] size: {content['size']} instead of {fmeta['size']}")
+                    # nothing to do, go on
+                    continue
+                # send, one by one, all required chunks
+                for cnk_idx in content['cnk_list']:
+                    # do not send the same chunk twice
+                    if not cnk_idx in waiting_chunks[content['name']]:
+                        waiting_chunks[content['name']].add(cnk_idx)
+                        w = {
+                            'file': content['name'],
+                            'cnk_idx': cnk_idx,
+                        }
+                        req_chunks.append(w)
+                        if verbose:
+                            print("Register work:", w)
+                        pendig_work = True
 
+        # Timeout! Send server hello!
+        elif not pendig_work:
+            # but only if no work is pending!
+            if verbose:
+                print("Broadcast server hello packet")
+            smfsp.send_server_hello(sock, clients, fmap)
 
 
 def main():
@@ -116,9 +183,6 @@ def main():
     test_client = ('255.255.255.255', CLIENT_PORT)
     # main loop - send hello packets
     smfsp.send_server_hello(sock, test_client, fmap)
-
-    # test - send chunk of the first file
-    smfsp.send_chunk(sock, test_client, fmap, list(fmap.keys())[0], 0)
 
     server_loop([sock, broad_sock], fmap)
 
